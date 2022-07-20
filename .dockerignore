@@ -1,5 +1,6 @@
 .build/
 .tarballs/
+.Dockerfile
 
 !.build/linux-amd64/
 !.build/linux-armv7

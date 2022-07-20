@@ -19,6 +19,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -89,10 +90,10 @@ func handler(w http.ResponseWriter, r *http.Request, logger log.Logger) {
 
 	moduleName := ""
 	if len(segments) > 5 && segments[4] == "module" {
-		moduleName = segments[3]
+		moduleName = segments[5]
 	}
 	if moduleName == "" {
-		moduleName := query.Get("module")
+		moduleName = query.Get("module")
 	}
 	if len(query["module"]) > 1 {
 		http.Error(w, "'module' parameter must only be specified once", 400)
@@ -210,7 +211,10 @@ func main() {
 
 	http.Handle("/metrics", promhttp.Handler()) // Normal metrics endpoint for SNMP exporter itself.
 	// Endpoint to do SNMP scrapes.
-	http.HandleFunc("/snmp", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/snmp", func(w http.ResponseWriter, r *http.Request) { // Handler for //snmp?<query> style
+		handler(w, r, logger)
+	})
+	http.HandleFunc("/snmp/", func(w http.ResponseWriter, r *http.Request) { // Handler for /snmp/target/<target> style
 		handler(w, r, logger)
 	})
 	http.HandleFunc("/-/reload", updateConfiguration) // Endpoint to reload configuration.
