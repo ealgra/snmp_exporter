@@ -73,14 +73,27 @@ func init() {
 func handler(w http.ResponseWriter, r *http.Request, logger log.Logger) {
 	query := r.URL.Query()
 
-	target := query.Get("target")
-	if len(query["target"]) != 1 || target == "" {
+	target := ""
+	segments := []string(strings.Split(r.URL.EscapedPath(), "/"))
+	if len(segments) > 3 && segments[2] == "target" {
+		target = segments[3]
+	}
+	if target == "" {
+		target = query.Get("target")
+	}
+	if len(query["target"]) > 1 || target == "" {
 		http.Error(w, "'target' parameter must be specified once", 400)
 		snmpRequestErrors.Inc()
 		return
 	}
 
-	moduleName := query.Get("module")
+	moduleName := ""
+	if len(segments) > 5 && segments[4] == "module" {
+		moduleName = segments[3]
+	}
+	if moduleName == "" {
+		moduleName := query.Get("module")
+	}
 	if len(query["module"]) > 1 {
 		http.Error(w, "'module' parameter must only be specified once", 400)
 		snmpRequestErrors.Inc()
