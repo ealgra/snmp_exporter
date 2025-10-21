@@ -15,41 +15,44 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
-	"gopkg.in/alecthomas/kingpin.v2"
-	"gopkg.in/yaml.v2"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/common/promslog/flag"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/snmp_exporter/config"
 )
 
+var cannotFindModuleRE = regexp.MustCompile(`Cannot find module \((.+)\): (.+)`)
+
 // Generate a snmp_exporter config and write it out.
-func generateConfig(nodes *Node, nameToNode map[string]*Node, logger log.Logger) error {
+func generateConfig(nodes *Node, nameToNode map[string]*Node, logger *slog.Logger) error {
 	outputPath, err := filepath.Abs(*outputPath)
 	if err != nil {
 		return fmt.Errorf("unable to determine absolute path for output")
 	}
 
-	content, err := ioutil.ReadFile("generator.yml")
+	content, err := os.ReadFile(*generatorYmlPath)
 	if err != nil {
-		return fmt.Errorf("error reading yml config: %s", err)
+		return fmt.Errorf("error reading yml config: %w", err)
 	}
 	cfg := &Config{}
 	err = yaml.UnmarshalStrict(content, cfg)
 	if err != nil {
-		return fmt.Errorf("error parsing yml config: %s", err)
+		return fmt.Errorf("error parsing yml config: %w", err)
 	}
 
 	outputConfig := config.Config{}
+	outputConfig.Auths = cfg.Auths
+	outputConfig.Modules = make(map[string]*config.Module, len(cfg.Modules))
 	for name, m := range cfg.Modules {
-		level.Info(logger).Log("msg", "Generating config for module", "module", name)
+		logger.Info("Generating config for module", "module", name)
 		// Give each module a copy of the tree so that it can be modified.
 		mNodes := nodes.Copy()
 		// Build the map with new pointers.
@@ -57,81 +60,92 @@ func generateConfig(nodes *Node, nameToNode map[string]*Node, logger log.Logger)
 		walkNode(mNodes, func(n *Node) {
 			mNameToNode[n.Oid] = n
 			mNameToNode[n.Label] = n
+			if n.Module != "" {
+				mNameToNode[n.Module+"::"+n.Label] = n
+			}
 		})
 		out, err := generateConfigModule(m, mNodes, mNameToNode, logger)
 		if err != nil {
 			return err
 		}
-		outputConfig[name] = out
-		outputConfig[name].WalkParams = m.WalkParams
-		level.Info(logger).Log("msg", "Generated metrics", "module", name, "metrics", len(outputConfig[name].Metrics))
+		outputConfig.Modules[name] = out
+		outputConfig.Modules[name].WalkParams = m.WalkParams
+		logger.Info("Generated metrics", "module", name, "metrics", len(outputConfig.Modules[name].Metrics))
 	}
 
 	config.DoNotHideSecrets = true
 	out, err := yaml.Marshal(outputConfig)
 	config.DoNotHideSecrets = false
 	if err != nil {
-		return fmt.Errorf("error marshaling yml: %s", err)
+		return fmt.Errorf("error marshaling yml: %w", err)
 	}
 
 	// Check the generated config to catch auth/version issues.
 	err = yaml.UnmarshalStrict(out, &config.Config{})
 	if err != nil {
-		return fmt.Errorf("error parsing generated config: %s", err)
+		return fmt.Errorf("error parsing generated config: %w", err)
 	}
 
 	f, err := os.Create(outputPath)
 	if err != nil {
-		return fmt.Errorf("error opening output file: %s", err)
+		return fmt.Errorf("error opening output file: %w", err)
 	}
 	out = append([]byte("# WARNING: This file was auto-generated using snmp_exporter generator, manual changes will be lost.\n"), out...)
 	_, err = f.Write(out)
 	if err != nil {
-		return fmt.Errorf("error writing to output file: %s", err)
+		return fmt.Errorf("error writing to output file: %w", err)
 	}
-	level.Info(logger).Log("msg", "Config written", "file", outputPath)
+	logger.Info("Config written", "file", outputPath)
 	return nil
 }
 
 var (
-	failOnParseErrors  = kingpin.Flag("fail-on-parse-errors", "Exit with a non-zero status if there are MIB parsing errors").Default("false").Bool()
+	failOnParseErrors  = kingpin.Flag("fail-on-parse-errors", "Exit with a non-zero status if there are MIB parsing errors").Default("true").Bool()
+	snmpMIBOpts        = kingpin.Flag("snmp.mibopts", "Toggle various defaults controlling MIB parsing, see snmpwalk --help").Default("eu").String()
 	generateCommand    = kingpin.Command("generate", "Generate snmp.yml from generator.yml")
-	outputPath         = generateCommand.Flag("output-path", "Path to to write resulting config file").Default("snmp.yml").Short('o').String()
+	userMibsDir        = kingpin.Flag("mibs-dir", "Paths to mibs directory").Default("").Short('m').Strings()
+	generatorYmlPath   = generateCommand.Flag("generator-path", "Path to the input generator.yml file").Default("generator.yml").Short('g').String()
+	outputPath         = generateCommand.Flag("output-path", "Path to write the snmp_exporter's config file").Default("snmp.yml").Short('o').String()
 	parseErrorsCommand = kingpin.Command("parse_errors", "Debug: Print the parse errors output by NetSNMP")
 	dumpCommand        = kingpin.Command("dump", "Debug: Dump the parsed and prepared MIBs")
 )
 
 func main() {
-	promlogConfig := &promlog.Config{}
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	promslogConfig := &promslog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promslogConfig)
 	kingpin.HelpFlag.Short('h')
 	command := kingpin.Parse()
-	logger := promlog.New(promlogConfig)
+	logger := promslog.New(promslogConfig)
 
-	parseOutput, err := initSNMP(logger)
+	output, err := initSNMP(logger)
 	if err != nil {
-		level.Error(logger).Log("msg", "Error initializing netsnmp", "err", err)
+		logger.Error("Error initializing netsnmp", "err", err)
 		os.Exit(1)
 	}
 
-	parseOutput = strings.TrimSpace(parseOutput)
-	parseErrors := len(parseOutput) != 0
-	if parseErrors {
-		level.Warn(logger).Log("msg", "NetSNMP reported parse error(s)", "errors", len(strings.Split(parseOutput, "\n")))
-	}
+	parseOutput := scanParseOutput(logger, output)
+	parseErrors := len(parseOutput)
 
 	nodes := getMIBTree()
 	nameToNode := prepareTree(nodes, logger)
 
 	switch command {
 	case generateCommand.FullCommand():
-		err := generateConfig(nodes, nameToNode, logger)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error generating config netsnmp", "err", err)
-			os.Exit(1)
+		if *failOnParseErrors && parseErrors > 0 {
+			logger.Error("Failing on reported parse error(s)", "help", "Use 'generator parse_errors' command to see errors, --no-fail-on-parse-errors to ignore")
+		} else {
+			err := generateConfig(nodes, nameToNode, logger)
+			if err != nil {
+				logger.Error("Error generating config netsnmp", "err", err)
+				os.Exit(1)
+			}
 		}
 	case parseErrorsCommand.FullCommand():
-		fmt.Println(parseOutput)
+		if parseErrors > 0 {
+			fmt.Printf("%s\n", strings.Join(parseOutput, "\n"))
+		} else {
+			logger.Info("No parse errors")
+		}
 	case dumpCommand.FullCommand():
 		walkNode(nodes, func(n *Node) {
 			t := n.Type
@@ -146,7 +160,28 @@ func main() {
 				n.Oid, n.Label, t, n.TextualConvention, n.Hint, n.Indexes, implied, n.EnumValues, n.Description)
 		})
 	}
-	if *failOnParseErrors && parseErrors {
+	if *failOnParseErrors && parseErrors > 0 {
 		os.Exit(1)
 	}
+}
+
+func scanParseOutput(logger *slog.Logger, output string) []string {
+	var parseOutput []string
+	output = strings.TrimSpace(strings.ToValidUTF8(output, "�"))
+	if output != "" {
+		parseOutput = strings.Split(output, "\n")
+	}
+	parseErrors := len(parseOutput)
+
+	if parseErrors > 0 {
+		logger.Warn("NetSNMP reported parse error(s)", "errors", parseErrors)
+	}
+
+	for _, line := range parseOutput {
+		if strings.HasPrefix(line, "Cannot find module") {
+			missing := cannotFindModuleRE.FindStringSubmatch(line)
+			logger.Error("Missing MIB", "mib", missing[1], "from", missing[2])
+		}
+	}
+	return parseOutput
 }

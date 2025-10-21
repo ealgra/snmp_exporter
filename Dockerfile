@@ -1,4 +1,4 @@
-FROM quay.io/prometheus/golang-builder:1.15-base AS builder
+FROM quay.io/prometheus/golang-builder:1.24-base AS builder
 
 ARG ARCH="amd64"
 ARG OS="linux"

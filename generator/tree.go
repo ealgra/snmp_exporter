@@ -15,13 +15,12 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 
 	"github.com/prometheus/snmp_exporter/config"
 )
@@ -44,7 +43,7 @@ func walkNode(n *Node, f func(n *Node)) {
 }
 
 // Transform the tree.
-func prepareTree(nodes *Node, logger log.Logger) map[string]*Node {
+func prepareTree(nodes *Node, logger *slog.Logger) map[string]*Node {
 	// Build a map from names and oids to nodes.
 	nameToNode := map[string]*Node{}
 	walkNode(nodes, func(n *Node) {
@@ -80,7 +79,7 @@ func prepareTree(nodes *Node, logger log.Logger) map[string]*Node {
 		}
 		augmented, ok := nameToNode[n.Augments]
 		if !ok {
-			level.Warn(logger).Log("msg", "Can't find augmenting node", "augments", n.Augments, "node", n.Label)
+			logger.Warn("Can't find augmenting node", "augments", n.Augments, "node", n.Label)
 			return
 		}
 		for _, c := range n.Children {
@@ -109,8 +108,7 @@ func prepareTree(nodes *Node, logger log.Logger) map[string]*Node {
 	walkNode(nodes, func(n *Node) {
 		// Set type on MAC addresses and strings.
 		// RFC 2579
-		switch n.Hint {
-		case "1x:":
+		if n.Hint == "1x:" {
 			n.Type = "PhysAddress48"
 		}
 		if displayStringRe.MatchString(n.Hint) {
@@ -134,6 +132,12 @@ func prepareTree(nodes *Node, logger log.Logger) map[string]*Node {
 		// Convert RFC 2579 DateAndTime textual convention to type.
 		if n.TextualConvention == "DateAndTime" {
 			n.Type = "DateAndTime"
+		}
+		if n.TextualConvention == "ParseDateAndTime" {
+			n.Type = "ParseDateAndTime"
+		}
+		if n.TextualConvention == "NTPTimeStamp" {
+			n.Type = "NTPTimeStamp"
 		}
 		// Convert RFC 4001 InetAddress types textual convention to type.
 		if n.TextualConvention == "InetAddressIPv4" || n.TextualConvention == "InetAddressIPv6" || n.TextualConvention == "InetAddress" {
@@ -167,6 +171,10 @@ func metricType(t string) (string, bool) {
 		return t, true
 	case "DateAndTime":
 		return t, true
+	case "ParseDateAndTime":
+		return t, true
+	case "NTPTimeStamp":
+		return t, true
 	case "EnumAsInfo", "EnumAsStateSet":
 		return t, true
 	default:
@@ -180,7 +188,7 @@ func metricAccess(a string) bool {
 	case "ACCESS_READONLY", "ACCESS_READWRITE", "ACCESS_CREATE", "ACCESS_NOACCESS":
 		return true
 	default:
-		// the others are inaccessible metrics.
+		// The others are inaccessible metrics.
 		return false
 	}
 }
@@ -232,9 +240,8 @@ func getMetricNode(oid string, node *Node, nameToNode map[string]*Node) (*Node, 
 		_, ok = metricType(n.Type)
 		if ok && metricAccess(n.Access) && len(n.Indexes) == 0 {
 			return n, oidScalar
-		} else {
-			return n, oidSubtree
 		}
+		return n, oidSubtree
 	}
 
 	// Unknown OID/name, search Node tree for longest match.
@@ -252,7 +259,27 @@ func getMetricNode(oid string, node *Node, nameToNode map[string]*Node) (*Node, 
 	return n, oidInstance
 }
 
-func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*Node, logger log.Logger) (*config.Module, error) {
+// In the case of multiple nodes with the same label try to return the node
+// where the OID matches in every branch apart from the last one.
+func getIndexNode(lookup string, nameToNode map[string]*Node, metricOid string) *Node {
+	for _, node := range nameToNode {
+		if node.Label != lookup {
+			continue
+		}
+
+		oid := strings.Split(metricOid, ".")
+		oidPrefix := strings.Join(oid[:len(oid)-1], ".")
+
+		if strings.HasPrefix(node.Oid, oidPrefix) {
+			return node
+		}
+	}
+
+	// If no node matches, revert to previous behavior.
+	return nameToNode[lookup]
+}
+
+func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*Node, logger *slog.Logger) (*config.Module, error) {
 	out := &config.Module{}
 	needToWalk := map[string]struct{}{}
 	tableInstances := map[string][]string{}
@@ -265,7 +292,7 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 		// Find node to override.
 		n, ok := nameToNode[name]
 		if !ok {
-			level.Warn(logger).Log("msg", "Could not find node to override type", "node", name)
+			logger.Warn("Could not find node to override type", "node", name)
 			continue
 		}
 		// params.Type validated at generator configuration.
@@ -275,6 +302,9 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 	// Remove redundant OIDs to be walked.
 	toWalk := []string{}
 	for _, oid := range cfg.Walk {
+		if strings.HasPrefix(oid, ".") {
+			return nil, fmt.Errorf("invalid OID %s, prefix of '.' should be removed", oid)
+		}
 		// Resolve name to OID if possible.
 		n, ok := nameToNode[oid]
 		if ok {
@@ -341,17 +371,20 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 				return // Ignored metric.
 			}
 
+			// Afi (Address family)
 			prevType := ""
+			// Safi (Subsequent address family, e.g. Multicast/Unicast)
+			prev2Type := ""
 			for count, i := range n.Indexes {
 				index := &config.Index{Labelname: i}
 				indexNode, ok := nameToNode[i]
 				if !ok {
-					level.Warn(logger).Log("msg", "Could not find index for node", "node", n.Label, "index", i)
+					logger.Warn("Could not find index for node", "node", n.Label, "index", i)
 					return
 				}
 				index.Type, ok = metricType(indexNode.Type)
 				if !ok {
-					level.Warn(logger).Log("msg", "Can't handle index type on node", "node", n.Label, "index", i, "type", indexNode.Type)
+					logger.Warn("Can't handle index type on node", "node", n.Label, "index", i, "type", indexNode.Type)
 					return
 				}
 				index.FixedSize = indexNode.FixedSize
@@ -362,13 +395,17 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 
 				// Convert (InetAddressType,InetAddress) to (InetAddress)
 				if subtype, ok := combinedTypes[index.Type]; ok {
-					if prevType == subtype {
+					switch subtype {
+					case prevType:
 						metric.Indexes = metric.Indexes[:len(metric.Indexes)-1]
-					} else {
-						level.Warn(logger).Log("msg", "Can't handle index type on node, missing preceding", "node", n.Label, "type", index.Type, "missing", subtype)
+					case prev2Type:
+						metric.Indexes = metric.Indexes[:len(metric.Indexes)-2]
+					default:
+						logger.Warn("Can't handle index type on node, missing preceding", "node", n.Label, "type", index.Type, "missing", subtype)
 						return
 					}
 				}
+				prev2Type = prevType
 				prevType = indexNode.TextualConvention
 				metric.Indexes = append(metric.Indexes, index)
 			}
@@ -376,9 +413,29 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 		})
 	}
 
+	// Build an map of all oid targeted by a filter to access it easily later.
+	filterMap := map[string][]string{}
+
+	for _, filter := range cfg.Filters.Static {
+		for _, oid := range filter.Targets {
+			n, ok := nameToNode[oid]
+			if ok {
+				oid = n.Oid
+			}
+			filterMap[oid] = filter.Indices
+		}
+	}
+
 	// Apply lookups.
 	for _, metric := range out.Metrics {
 		toDelete := []string{}
+
+		// Build a list of lookup labels which are required as index.
+		requiredAsIndex := []string{}
+		for _, lookup := range cfg.Lookups {
+			requiredAsIndex = append(requiredAsIndex, lookup.SourceIndexes...)
+		}
+
 		for _, lookup := range cfg.Lookups {
 			foundIndexes := 0
 			// See if all lookup indexes are present.
@@ -393,7 +450,7 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 				if _, ok := nameToNode[lookup.Lookup]; !ok {
 					return nil, fmt.Errorf("unknown index '%s'", lookup.Lookup)
 				}
-				indexNode := nameToNode[lookup.Lookup]
+				indexNode := getIndexNode(lookup.Lookup, nameToNode, metric.Oid)
 				typ, ok := metricType(indexNode.Type)
 				if !ok {
 					return nil, fmt.Errorf("unknown index type %s for %s", indexNode.Type, lookup.Lookup)
@@ -407,6 +464,14 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 					l.Labels = append(l.Labels, sanitizeLabelName(oldIndex))
 				}
 				metric.Lookups = append(metric.Lookups, l)
+
+				// If lookup label is used as source index in another lookup,
+				// we need to add this new label as another index.
+				if slices.Contains(requiredAsIndex, l.Labelname) {
+					idx := &config.Index{Labelname: l.Labelname, Type: l.Type}
+					metric.Indexes = append(metric.Indexes, idx)
+				}
+
 				// Make sure we walk the lookup OID(s).
 				if len(tableInstances[metric.Oid]) > 0 {
 					for _, index := range tableInstances[metric.Oid] {
@@ -414,6 +479,14 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 					}
 				} else {
 					needToWalk[indexNode.Oid] = struct{}{}
+				}
+				// We apply the same filter to metric.Oid if the lookup oid is filtered.
+				indices, found := filterMap[indexNode.Oid]
+				if found {
+					delete(needToWalk, metric.Oid)
+					for _, index := range indices {
+						needToWalk[metric.Oid+"."+index+"."] = struct{}{}
+					}
 				}
 				if lookup.DropSourceIndexes {
 					// Avoid leaving the old labelname around.
@@ -435,26 +508,27 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 		}
 	}
 
-	// Check that the object before an InetAddress is an InetAddressType,
-	// if not, change it to an OctetString.
+	// Check that the object before an InetAddress is an InetAddressType.
+	// If not, change it to an OctetString.
 	for _, metric := range out.Metrics {
-		if metric.Type == "InetAddress" || metric.Type == "InetAddressMissingSize" {
-			// Get previous oid.
-			oids := strings.Split(metric.Oid, ".")
-			i, _ := strconv.Atoi(oids[len(oids)-1])
-			oids[len(oids)-1] = strconv.Itoa(i - 1)
-			prevOid := strings.Join(oids, ".")
-			if prevObj, ok := nameToNode[prevOid]; !ok || prevObj.TextualConvention != "InetAddressType" {
-				metric.Type = "OctetString"
-			} else {
-				// Make sure the InetAddressType is included.
-				if len(tableInstances[metric.Oid]) > 0 {
-					for _, index := range tableInstances[metric.Oid] {
-						needToWalk[prevOid+index+"."] = struct{}{}
-					}
-				} else {
-					needToWalk[prevOid] = struct{}{}
+		if metric.Type != "InetAddress" && metric.Type != "InetAddressMissingSize" {
+			continue
+		}
+		// Get previous oid.
+		oids := strings.Split(metric.Oid, ".")
+		i, _ := strconv.Atoi(oids[len(oids)-1])
+		oids[len(oids)-1] = strconv.Itoa(i - 1)
+		prevOid := strings.Join(oids, ".")
+		if prevObj, ok := nameToNode[prevOid]; !ok || prevObj.TextualConvention != "InetAddressType" {
+			metric.Type = "OctetString"
+		} else {
+			// Make sure the InetAddressType is included.
+			if len(tableInstances[metric.Oid]) > 0 {
+				for _, index := range tableInstances[metric.Oid] {
+					needToWalk[prevOid+index+"."] = struct{}{}
 				}
+			} else {
+				needToWalk[prevOid] = struct{}{}
 			}
 		}
 	}
@@ -462,11 +536,38 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 	// Apply module config overrides to their corresponding metrics.
 	for name, params := range cfg.Overrides {
 		for _, metric := range out.Metrics {
-			if name == metric.Name || name == metric.Oid {
-				metric.RegexpExtracts = params.RegexpExtracts
+			if name != metric.Name && name != metric.Oid {
+				continue
+			}
+			metric.RegexpExtracts = params.RegexpExtracts
+			metric.DateTimePattern = params.DateTimePattern
+			metric.Offset = params.Offset
+			metric.Scale = params.Scale
+			if params.Help != "" {
+				metric.Help = params.Help
+			}
+			if params.Name != "" {
+				metric.Name = params.Name
 			}
 		}
 	}
+
+	// Apply filters.
+	for _, filter := range cfg.Filters.Static {
+		// Delete the oid targeted by the filter, as we won't walk the whole table.
+		for _, oid := range filter.Targets {
+			n, ok := nameToNode[oid]
+			if ok {
+				oid = n.Oid
+			}
+			delete(needToWalk, oid)
+			for _, index := range filter.Indices {
+				needToWalk[oid+"."+index+"."] = struct{}{}
+			}
+		}
+	}
+
+	out.Filters = cfg.Filters.Dynamic
 
 	oids := []string{}
 	for k := range needToWalk {
@@ -483,9 +584,7 @@ func generateConfigModule(cfg *ModuleConfig, node *Node, nameToNode map[string]*
 	return out, nil
 }
 
-var (
-	invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
-)
+var invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 func sanitizeLabelName(name string) string {
 	return invalidLabelCharRE.ReplaceAllString(name, "_")

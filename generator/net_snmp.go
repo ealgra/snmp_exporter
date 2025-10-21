@@ -18,10 +18,22 @@ package main
 #cgo CFLAGS: -I/usr/local/include
 #include <net-snmp/net-snmp-config.h>
 #include <net-snmp/mib_api.h>
+#include <net-snmp/agent/agent_callbacks.h>
+#include <net-snmp/library/default_store.h>
+#include <net-snmp/library/parse.h>
 #include <unistd.h>
 // From parse.c
+// Hacky workarounds to detect which version of net-snmp this
+// based on various headers that appear in 5.8 and 5.9.
+#if !defined(NETSNMP_DS_LIB_ADD_FORWARDER_INFO)
+#if defined(SNMPD_CALLBACK_UNREGISTER_NOTIFICATIONS)
+#define MAXTC   16384
+#else
 #define MAXTC   4096
-  struct tc {
+#endif
+#endif
+
+struct tc {
   int             type;
   int             modid;
   char           *descriptor;
@@ -29,11 +41,17 @@ package main
   struct enum_list *enums;
   struct range_list *ranges;
   char           *description;
+#if !defined(NETSNMP_DS_LIB_ADD_FORWARDER_INFO)
 } tclist[MAXTC];
+int tc_alloc = MAXTC;
+#else
+} *tclist;
+int tc_alloc;
+#endif
 
 // Return the size of a fixed, or 0 if it is not fixed.
 int get_tc_fixed_size(int tc_index) {
-	if (tc_index < 0 || tc_index >= MAXTC) {
+  if (tc_index < 0 || tc_index >= tc_alloc) {
     return 0;
   }
   struct range_list *ranges;
@@ -50,18 +68,18 @@ import "C"
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"os"
 	"sort"
-
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"strings"
 )
 
 // One entry in the tree of the MIB.
 type Node struct {
 	Oid               string
 	subid             int64
+	Module            string
 	Label             string
 	Augments          string
 	Children          []*Node
@@ -134,23 +152,38 @@ var (
 	}
 )
 
+// getMibsDir joins the user-specified MIB directories into a single string; if the user didn't pass any,
+// the default netsnmp mibs directory is returned.
+func getMibsDir(paths []string) string {
+	if len(paths) == 1 && paths[0] == "" {
+		return C.GoString(C.netsnmp_get_mib_directory())
+	}
+	return strings.Join(paths, ":")
+}
+
 // Initialize NetSNMP. Returns MIB parse errors.
 //
 // Warning: This function plays with the stderr file descriptor.
-func initSNMP(logger log.Logger) (string, error) {
+func initSNMP(logger *slog.Logger) (string, error) {
 	// Load all the MIBs.
-	os.Setenv("MIBS", "ALL")
-	// Help the user find their MIB directories.
-	level.Info(logger).Log("msg", "Loading MIBs", "from", C.GoString(C.netsnmp_get_mib_directory()))
+	err := os.Setenv("MIBS", "ALL")
+	if err != nil {
+		return "", err
+	}
+	mibsDir := getMibsDir(*userMibsDir)
+	logger.Info("Loading MIBs", "from", mibsDir)
+	C.netsnmp_set_mib_directory(C.CString(mibsDir))
+	if *snmpMIBOpts != "" {
+		C.snmp_mib_toggle_options(C.CString(*snmpMIBOpts))
+	}
 	// We want the descriptions.
 	C.snmp_set_save_descriptions(1)
-
 	// Make stderr go to a pipe, as netsnmp tends to spew a
 	// lot of errors on startup that there's no apparent
 	// way to disable or redirect.
 	r, w, err := os.Pipe()
 	if err != nil {
-		return "", fmt.Errorf("error creating pipe: %s", err)
+		return "", fmt.Errorf("error creating pipe: %w", err)
 	}
 	defer r.Close()
 	defer w.Close()
@@ -160,9 +193,9 @@ func initSNMP(logger log.Logger) (string, error) {
 	ch := make(chan string)
 	errch := make(chan error)
 	go func() {
-		data, err := ioutil.ReadAll(r)
+		data, err := io.ReadAll(r)
 		if err != nil {
-			errch <- fmt.Errorf("error reading from pipe: %s", err)
+			errch <- fmt.Errorf("error reading from pipe: %w", err)
 			return
 		}
 		errch <- nil
@@ -190,6 +223,9 @@ func buildMIBTree(t *C.struct_tree, n *Node, oid string) {
 		n.Oid = fmt.Sprintf("%s.%d", oid, t.subid)
 	} else {
 		n.Oid = fmt.Sprintf("%d", t.subid)
+	}
+	if m := C.find_module(t.modid); m != nil {
+		n.Module = C.GoString(m.name)
 	}
 	n.Label = C.GoString(t.label)
 	if typ, ok := netSnmptypeMap[int(t._type)]; ok {
@@ -253,7 +289,6 @@ func buildMIBTree(t *C.struct_tree, n *Node, oid string) {
 
 // Convert the NetSNMP MIB tree to a Go data structure.
 func getMIBTree() *Node {
-
 	tree := C.get_tree_head()
 	head := &Node{}
 	buildMIBTree(tree, head, "")
